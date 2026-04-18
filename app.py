@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
 from typing import Dict, List, Optional, Tuple
+import hmac
 import math
 import re
 
-import openpyxl
+import gspread
+from gspread.utils import rowcol_to_a1
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -15,8 +16,7 @@ import streamlit as st
 
 
 APP_TITLE = "Workout Tracker"
-APP_VERSION = "2026.04.18.3"
-DEFAULT_WORKBOOK_NAME = "Workouts.xlsx"
+APP_VERSION = "2026.04.18.5"
 TRACKING_SHEETS = ["Chen Tracking", "Ananda Tracking"]
 SPLIT_SHEETS = ["5 Day Split", "3 Day Split"]
 
@@ -29,6 +29,26 @@ MAIN_LIFT_KEYWORDS = [
     "press",
     "rdl",
     "split squat",
+]
+
+TRACKING_HEADERS = [
+    "Date",
+    "Day (Split)",
+    "Exercise",
+    "Set 1 weight",
+    "Set 1 Reps",
+    "Set 2 weight",
+    "Set 2 Reps",
+    "Set 3 weight",
+    "Set 3 Reps",
+    "Set 4 weight",
+    "Set 4 Reps",
+    "Total Reps",
+    "Weight Moved",
+    "Notes Set 1",
+    "Notes Set 2",
+    "Notes Set 3",
+    "Notes Set 4",
 ]
 
 
@@ -53,12 +73,50 @@ class LastPerformance:
 st.set_page_config(page_title=APP_TITLE, page_icon="🏋️", layout="wide")
 
 
+# ---------- Access control ----------
+def require_app_password() -> None:
+    expected_password = str(st.secrets.get("app_password", "")).strip()
+    if not expected_password:
+        st.title("🏋️ Workout Tracker")
+        st.error("App password is not configured yet.")
+        st.code(
+            'app_password = "choose-a-shared-password"',
+            language="toml",
+        )
+        st.caption("Add that line to .streamlit/secrets.toml locally and to the app Secrets in Streamlit Cloud.")
+        st.stop()
+
+    def password_entered() -> None:
+        st.session_state["password_attempted"] = True
+        entered_password = str(st.session_state.get("password_input", ""))
+        if hmac.compare_digest(entered_password, expected_password):
+            st.session_state["password_ok"] = True
+            st.session_state.pop("password_input", None)
+        else:
+            st.session_state["password_ok"] = False
+
+    if st.session_state.get("password_ok", False):
+        return
+
+    st.title("🏋️ Workout Tracker")
+    st.caption("Enter the shared password to open the app.")
+    st.text_input("Password", type="password", key="password_input", on_change=password_entered)
+
+    if st.session_state.get("password_attempted", False) and not st.session_state.get("password_ok", False):
+        st.error("Wrong password.")
+
+    st.stop()
+
+
 # ---------- Safety helpers ----------
 def safe_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
+    text = str(value).strip()
+    if text == "":
+        return default
     try:
-        number = float(value)
+        number = float(text)
     except (TypeError, ValueError):
         return default
     if pd.isna(number) or math.isnan(number) or math.isinf(number):
@@ -70,47 +128,117 @@ def safe_int(value, default: int = 0) -> int:
     return int(round(safe_float(value, float(default))))
 
 
-# ---------- Workbook helpers ----------
-def workbook_path_from_sidebar() -> Path:
-    default_path = Path(__file__).resolve().parent / DEFAULT_WORKBOOK_NAME
-    manual_path = st.sidebar.text_input("Workbook path", value=str(default_path))
-    return Path(manual_path).expanduser().resolve()
-
-
-def format_split_value(value) -> str:
+def normalize_split_value(value) -> str:
     if value is None:
         return ""
-    if isinstance(value, datetime):
-        return f"{value.month}-{value.day}"
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value).strip()
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    # Excel-imported set/rep values sometimes become display-formatted dates like 2/3/2026.
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", text):
+        dt = pd.to_datetime(text, errors="coerce")
+        if pd.notna(dt):
+            return f"{dt.month}-{dt.day}"
+
+    if re.fullmatch(r"\d+\.0", text):
+        return str(int(float(text)))
+    return text
 
 
-def lift_category(exercise_name: str) -> str:
-    lowered = exercise_name.lower()
-    return "Main" if any(keyword in lowered for keyword in MAIN_LIFT_KEYWORDS) else "Accessory"
+def to_sheet_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
-def load_workbook_object(path: Path, data_only: bool = False):
-    return openpyxl.load_workbook(path, data_only=data_only)
+# ---------- Google Sheets helpers ----------
+def get_service_account_info() -> Optional[dict]:
+    if "gcp_service_account" in st.secrets:
+        return dict(st.secrets["gcp_service_account"])
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        gs = dict(st.secrets["connections"]["gsheets"])
+        keys = [
+            "type",
+            "project_id",
+            "private_key_id",
+            "private_key",
+            "client_email",
+            "client_id",
+            "auth_uri",
+            "token_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+        ]
+        info = {k: gs.get(k) for k in keys if gs.get(k)}
+        return info or None
+    return None
 
 
-def read_split_sheet(path: Path, sheet_name: str) -> Dict[str, List[SplitExercise]]:
-    wb = load_workbook_object(path, data_only=False)
-    ws = wb[sheet_name]
+def get_spreadsheet_locator() -> Optional[str]:
+    if "google_sheet_url" in st.secrets:
+        return str(st.secrets["google_sheet_url"])
+    if "google_sheet_id" in st.secrets:
+        return str(st.secrets["google_sheet_id"])
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        gs = st.secrets["connections"]["gsheets"]
+        if "spreadsheet" in gs:
+            return str(gs["spreadsheet"])
+    return None
+
+
+@st.cache_resource
+def get_spreadsheet():
+    service_account_info = get_service_account_info()
+    locator = get_spreadsheet_locator()
+    if not service_account_info or not locator:
+        raise RuntimeError("Missing Google Sheets credentials or spreadsheet locator.")
+
+    client = gspread.service_account_from_dict(service_account_info)
+    if locator.startswith("http"):
+        return client.open_by_url(locator)
+    return client.open_by_key(locator)
+
+
+def get_worksheet(sheet_name: str):
+    spreadsheet = get_spreadsheet()
+    return spreadsheet.worksheet(sheet_name)
+
+
+def worksheet_matrix(sheet_name: str) -> List[List[str]]:
+    ws = get_worksheet(sheet_name)
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+    max_cols = max(len(row) for row in rows)
+    return [row + [""] * (max_cols - len(row)) for row in rows]
+
+
+def read_split_sheet(sheet_name: str) -> Dict[str, List[SplitExercise]]:
+    matrix = worksheet_matrix(sheet_name)
+    if not matrix:
+        return {}
+
+    max_cols = max(len(row) for row in matrix)
     split: Dict[str, List[SplitExercise]] = {}
 
-    for start_col in range(1, ws.max_column + 1, 4):
-        title = format_split_value(ws.cell(1, start_col).value)
+    for start_col in range(0, max_cols, 4):
+        title = normalize_split_value(matrix[0][start_col] if len(matrix) > 0 and start_col < len(matrix[0]) else "")
         if not title:
             continue
 
         exercises: List[SplitExercise] = []
-        for row_idx in range(3, ws.max_row + 1):
-            exercise = format_split_value(ws.cell(row_idx, start_col).value)
-            sets = format_split_value(ws.cell(row_idx, start_col + 1).value)
-            reps = format_split_value(ws.cell(row_idx, start_col + 2).value)
+        for row_idx in range(2, len(matrix)):
+            row = matrix[row_idx]
+            exercise = normalize_split_value(row[start_col] if start_col < len(row) else "")
+            sets = normalize_split_value(row[start_col + 1] if start_col + 1 < len(row) else "")
+            reps = normalize_split_value(row[start_col + 2] if start_col + 2 < len(row) else "")
             if not exercise:
                 continue
             exercises.append(
@@ -127,39 +255,46 @@ def read_split_sheet(path: Path, sheet_name: str) -> Dict[str, List[SplitExercis
     return split
 
 
-def read_instructions_sheet(path: Path, sheet_name: str = "Instructions") -> pd.DataFrame:
-    wb = load_workbook_object(path, data_only=False)
-    ws = wb[sheet_name]
+def read_instructions_sheet(sheet_name: str = "Instructions") -> pd.DataFrame:
+    matrix = worksheet_matrix(sheet_name)
     rows = []
-    for row_idx in range(1, ws.max_row + 1):
-        label = ws.cell(row_idx, 1).value
-        detail = ws.cell(row_idx, 2).value
-        if label is None and detail is None:
+    for row in matrix:
+        label = normalize_split_value(row[0] if len(row) > 0 else "")
+        detail = normalize_split_value(row[1] if len(row) > 1 else "")
+        if not label and not detail:
             continue
-        rows.append({"Label": format_split_value(label), "Detail": format_split_value(detail)})
+        rows.append({"Label": label, "Detail": detail})
     return pd.DataFrame(rows)
 
 
-def tracking_sheet_to_df(path: Path, sheet_name: str) -> pd.DataFrame:
-    wb = load_workbook_object(path, data_only=False)
-    ws = wb[sheet_name]
-    headers = [cell.value for cell in ws[1]]
-    rows = []
+def lift_category(exercise_name: str) -> str:
+    lowered = exercise_name.lower()
+    return "Main" if any(keyword in lowered for keyword in MAIN_LIFT_KEYWORDS) else "Accessory"
 
-    for row_idx in range(2, ws.max_row + 1):
-        exercise = ws.cell(row_idx, 3).value
-        date_value = ws.cell(row_idx, 1).value
-        if exercise in (None, "") and date_value in (None, ""):
+
+def tracking_sheet_to_df(sheet_name: str) -> pd.DataFrame:
+    matrix = worksheet_matrix(sheet_name)
+    if not matrix:
+        return pd.DataFrame(columns=TRACKING_HEADERS)
+
+    headers = matrix[0]
+    rows = []
+    for row in matrix[1:]:
+        padded = row + [""] * (len(headers) - len(row))
+        record = dict(zip(headers, padded))
+        if not str(record.get("Exercise", "")).strip() and not str(record.get("Date", "")).strip():
             continue
-        values = [ws.cell(row_idx, col_idx).value for col_idx in range(1, len(headers) + 1)]
-        rows.append(values)
+        rows.append(record)
 
     if not rows:
         return pd.DataFrame(columns=headers)
 
-    df = pd.DataFrame(rows, columns=headers)
-    df = df[df["Exercise"].notna()].copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = pd.DataFrame(rows)
+    if "Exercise" in df.columns:
+        df = df[df["Exercise"].astype(str).str.strip() != ""].copy()
+
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     numeric_cols = [
         "Day (Split)",
@@ -177,7 +312,10 @@ def tracking_sheet_to_df(path: Path, sheet_name: str) -> pd.DataFrame:
     df["Weight Moved"] = df.apply(calc_weight_moved, axis=1)
     df["Best Set Weight"] = df.apply(best_set_weight, axis=1)
     df["Estimated 1RM"] = df.apply(best_estimated_1rm, axis=1)
-    return df.sort_values(["Date", "Exercise"], ascending=[True, True])
+
+    if "Date" in df.columns:
+        df = df.sort_values(["Date", "Exercise"], ascending=[True, True])
+    return df
 
 
 def calc_total_reps(row: pd.Series) -> float:
@@ -212,13 +350,6 @@ def best_estimated_1rm(row: pd.Series) -> float:
         estimate = weight * (1 + reps / 30)
         best = max(best, estimate)
     return round(best, 2)
-
-
-def next_empty_row(ws) -> int:
-    for row_idx in range(2, ws.max_row + 2):
-        if ws.cell(row_idx, 1).value in (None, "") and ws.cell(row_idx, 3).value in (None, ""):
-            return row_idx
-    return ws.max_row + 1
 
 
 def row_to_performance(row: pd.Series) -> LastPerformance:
@@ -326,23 +457,32 @@ def next_set_number(performance: Optional[LastPerformance], max_sets: int) -> in
     return max_sets
 
 
-def find_or_create_exercise_row(ws, workout_date: date, day_number: int, exercise: str) -> int:
-    for row_idx in range(2, ws.max_row + 1):
-        row_date_value = pd.to_datetime(ws.cell(row_idx, 1).value, errors="coerce")
-        row_day = safe_int(ws.cell(row_idx, 2).value)
-        row_exercise = str(ws.cell(row_idx, 3).value or "").strip()
-        if pd.notna(row_date_value) and row_date_value.date() == workout_date and row_day == day_number and row_exercise.lower() == exercise.lower():
-            return row_idx
+def find_or_create_exercise_row(sheet_name: str, workout_date: date, day_number: int, exercise: str) -> int:
+    matrix = worksheet_matrix(sheet_name)
+    data_rows = matrix[1:] if len(matrix) > 1 else []
 
-    row_idx = next_empty_row(ws)
-    ws.cell(row_idx, 1).value = workout_date
-    ws.cell(row_idx, 2).value = day_number
-    ws.cell(row_idx, 3).value = exercise
-    return row_idx
+    for offset, row in enumerate(data_rows, start=2):
+        row_date = pd.to_datetime(row[0] if len(row) > 0 else "", errors="coerce")
+        row_day = safe_int(row[1] if len(row) > 1 else 0)
+        row_exercise = str(row[2] if len(row) > 2 else "").strip()
+        if pd.notna(row_date) and row_date.date() == workout_date and row_day == day_number and row_exercise.lower() == exercise.lower():
+            return offset
+
+    return len(matrix) + 1 if matrix else 2
+
+
+def update_cells(sheet_name: str, updates: Dict[Tuple[int, int], object]) -> None:
+    ws = get_worksheet(sheet_name)
+    payload = []
+    for (row_idx, col_idx), value in updates.items():
+        payload.append({
+            "range": rowcol_to_a1(row_idx, col_idx),
+            "values": [[to_sheet_value(value)]],
+        })
+    ws.batch_update(payload)
 
 
 def update_set_entry(
-    path: Path,
     sheet_name: str,
     workout_date: date,
     day_number: int,
@@ -352,29 +492,39 @@ def update_set_entry(
     reps: float,
     note: str,
 ) -> None:
-    wb = load_workbook_object(path, data_only=False)
-    ws = wb[sheet_name]
-    row_idx = find_or_create_exercise_row(ws, workout_date, day_number, exercise)
+    row_idx = find_or_create_exercise_row(sheet_name, workout_date, day_number, exercise)
+    existing_df = tracking_sheet_to_df(sheet_name)
+    current = find_current_session(existing_df, exercise, workout_date, day_number)
 
-    weight_col = 4 + (set_number - 1) * 2
-    reps_col = weight_col + 1
-    note_col = 14 + (set_number - 1)
+    existing_weights = current.weight_values if current else [0.0, 0.0, 0.0, 0.0]
+    existing_reps = current.rep_values if current else [0.0, 0.0, 0.0, 0.0]
+    existing_notes = [""] * 4
 
-    ws.cell(row_idx, weight_col).value = safe_float(weight) if safe_float(weight) > 0 else None
-    ws.cell(row_idx, reps_col).value = safe_float(reps) if safe_float(reps) > 0 else None
-    ws.cell(row_idx, note_col).value = str(note).strip() or None
+    matrix = worksheet_matrix(sheet_name)
+    if row_idx - 1 < len(matrix):
+        row = matrix[row_idx - 1]
+        for i in range(4):
+            note_col = 13 + i
+            existing_notes[i] = row[note_col] if note_col < len(row) else ""
 
-    total_reps = 0.0
-    total_volume = 0.0
-    for i in range(1, 5):
-        current_weight = safe_float(ws.cell(row_idx, 4 + (i - 1) * 2).value)
-        current_reps = safe_float(ws.cell(row_idx, 5 + (i - 1) * 2).value)
-        total_reps += current_reps
-        total_volume += current_weight * current_reps
+    existing_weights[set_number - 1] = safe_float(weight)
+    existing_reps[set_number - 1] = safe_float(reps)
+    existing_notes[set_number - 1] = str(note).strip()
 
-    ws.cell(row_idx, 12).value = safe_int(total_reps)
-    ws.cell(row_idx, 13).value = round(total_volume, 2)
-    wb.save(path)
+    total_reps = sum(existing_reps)
+    total_volume = sum(w * r for w, r in zip(existing_weights, existing_reps))
+
+    updates = {
+        (row_idx, 1): workout_date.isoformat(),
+        (row_idx, 2): day_number,
+        (row_idx, 3): exercise,
+        (row_idx, 4 + (set_number - 1) * 2): weight if safe_float(weight) > 0 else "",
+        (row_idx, 5 + (set_number - 1) * 2): reps if safe_float(reps) > 0 else "",
+        (row_idx, 14 + (set_number - 1)): existing_notes[set_number - 1],
+        (row_idx, 12): safe_int(total_reps),
+        (row_idx, 13): round(total_volume, 2),
+    }
+    update_cells(sheet_name, updates)
 
 
 def streak_days(df: pd.DataFrame) -> int:
@@ -466,22 +616,38 @@ def top_exercises_chart(df: pd.DataFrame):
 
 
 # ---------- UI ----------
-def sidebar_controls() -> Tuple[Path, str, str]:
+def sidebar_controls() -> Tuple[str, str]:
     st.sidebar.title("Settings")
-    workbook_path = workbook_path_from_sidebar()
-    tracking_sheet = st.sidebar.selectbox("Athlete / tracking tab", TRACKING_SHEETS)
+
+    person_labels = [sheet.replace(" Tracking", "") for sheet in TRACKING_SHEETS]
+    selected_person = st.sidebar.selectbox("Save/view section", person_labels)
+    tracking_sheet = f"{selected_person} Tracking"
+
     split_sheet = st.sidebar.selectbox("Program tab", SPLIT_SHEETS, index=0)
+
+    if st.sidebar.button("Lock app"):
+        st.session_state["password_ok"] = False
+        st.rerun()
+
     st.sidebar.caption(f"Version: {APP_VERSION}")
-    st.sidebar.caption("Tip: keep the workbook in the same folder as app.py for the easiest setup.")
-    return workbook_path, tracking_sheet, split_sheet
+    locator = get_spreadsheet_locator()
+    if locator:
+        st.sidebar.caption("Backend: Google Sheets")
+        st.sidebar.caption(locator)
+    return tracking_sheet, split_sheet
 
 
-def render_log_tab(workbook_path: Path, tracking_sheet: str, split_sheet: str):
+def render_log_tab(tracking_sheet: str, split_sheet: str):
     st.subheader("Log workout")
-    split = read_split_sheet(workbook_path, split_sheet)
-    history_df = tracking_sheet_to_df(workbook_path, tracking_sheet)
+    split = read_split_sheet(split_sheet)
+    history_df = tracking_sheet_to_df(tracking_sheet)
 
-    day_title = st.selectbox("Workout day", list(split.keys()))
+    day_titles = list(split.keys())
+    if not day_titles:
+        st.warning("No split data found in the selected program tab.")
+        return
+
+    day_title = st.selectbox("Workout day", day_titles)
     workout_date = st.date_input("Workout date", value=date.today())
     day_number = day_number_from_title(day_title)
 
@@ -563,7 +729,6 @@ def render_log_tab(workbook_path: Path, tracking_sheet: str, split_sheet: str):
                     st.warning("Enter at least weight or reps before saving that set.")
                 else:
                     update_set_entry(
-                        workbook_path,
                         tracking_sheet,
                         workout_date,
                         day_number,
@@ -577,9 +742,9 @@ def render_log_tab(workbook_path: Path, tracking_sheet: str, split_sheet: str):
                     st.rerun()
 
 
-def render_dashboard_tab(workbook_path: Path, tracking_sheet: str):
+def render_dashboard_tab(tracking_sheet: str):
     st.subheader("Progress dashboard")
-    df = tracking_sheet_to_df(workbook_path, tracking_sheet)
+    df = tracking_sheet_to_df(tracking_sheet)
     if df.empty:
         st.info("Start logging workouts and the dashboard will fill in automatically.")
         return
@@ -605,9 +770,12 @@ def render_dashboard_tab(workbook_path: Path, tracking_sheet: str):
         st.dataframe(recent, width="stretch", hide_index=True)
 
 
-def render_split_tab(workbook_path: Path, split_sheet: str):
+def render_split_tab(split_sheet: str):
     st.subheader("Program split")
-    split = read_split_sheet(workbook_path, split_sheet)
+    split = read_split_sheet(split_sheet)
+    if not split:
+        st.info("No split data found.")
+        return
     tabs = st.tabs(list(split.keys()))
     for tab, (day_title, exercises) in zip(tabs, split.items()):
         with tab:
@@ -617,11 +785,11 @@ def render_split_tab(workbook_path: Path, split_sheet: str):
             st.dataframe(day_df, width="stretch", hide_index=True)
 
 
-def render_instructions_tab(workbook_path: Path):
+def render_instructions_tab():
     st.subheader("Instructions")
-    instructions_df = read_instructions_sheet(workbook_path)
+    instructions_df = read_instructions_sheet()
     if instructions_df.empty:
-        st.info("No instructions found in the workbook.")
+        st.info("No instructions found in the sheet.")
         return
     for _, row in instructions_df.iterrows():
         if row["Detail"]:
@@ -630,9 +798,9 @@ def render_instructions_tab(workbook_path: Path):
             st.markdown(f"### {row['Label']}")
 
 
-def render_data_tab(workbook_path: Path, tracking_sheet: str):
+def render_data_tab(tracking_sheet: str):
     st.subheader("Data tools")
-    df = tracking_sheet_to_df(workbook_path, tracking_sheet)
+    df = tracking_sheet_to_df(tracking_sheet)
     if not df.empty:
         st.dataframe(df.sort_values("Date", ascending=False), width="stretch", hide_index=True)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
@@ -646,31 +814,62 @@ def render_data_tab(workbook_path: Path, tracking_sheet: str):
         st.info("No rows to export yet.")
 
     st.markdown("### App notes")
-    st.write("- The logger now saves one set at a time into the same exercise row.")
-    st.write("- Split and instruction tabs read directly from your workbook, so you only maintain one source of truth.")
-    st.write("- Progress charts are computed from the tracking sheet and do not require extra formulas in Excel.")
+    st.write("- This version uses Google Sheets as the source of truth.")
+    st.write("- The logger saves one set at a time into the same exercise row.")
+    st.write("- Split and instruction tabs read directly from your sheet tabs, so you only maintain one source of truth.")
+    st.write("- Progress charts are computed from the tracking sheet and do not require extra formulas in Google Sheets.")
+
+
+def render_setup_error(exc: Exception):
+    st.error("Google Sheets is not configured yet.")
+    st.code(
+        """
+# .streamlit/secrets.toml
+
+google_sheet_url = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+        """.strip(),
+        language="toml",
+    )
+    st.caption(str(exc))
+    st.stop()
 
 
 def main():
-    st.title("🏋️ Workout Tracker")
-    st.caption("Fast logging, built around your workbook.")
+    require_app_password()
 
-    workbook_path, tracking_sheet, split_sheet = sidebar_controls()
-    if not workbook_path.exists():
-        st.error(f"Workbook not found: {workbook_path}")
-        st.stop()
+    st.title("🏋️ Workout Tracker")
+    st.caption("Fast logging, built around your Google Sheet.")
+
+    try:
+        _ = get_spreadsheet()
+    except Exception as exc:  # pragma: no cover - setup feedback path
+        render_setup_error(exc)
+
+    tracking_sheet, split_sheet = sidebar_controls()
 
     tabs = st.tabs(["Log Workout", "Dashboard", "Split", "Instructions", "Data"])
     with tabs[0]:
-        render_log_tab(workbook_path, tracking_sheet, split_sheet)
+        render_log_tab(tracking_sheet, split_sheet)
     with tabs[1]:
-        render_dashboard_tab(workbook_path, tracking_sheet)
+        render_dashboard_tab(tracking_sheet)
     with tabs[2]:
-        render_split_tab(workbook_path, split_sheet)
+        render_split_tab(split_sheet)
     with tabs[3]:
-        render_instructions_tab(workbook_path)
+        render_instructions_tab()
     with tabs[4]:
-        render_data_tab(workbook_path, tracking_sheet)
+        render_data_tab(tracking_sheet)
 
 
 if __name__ == "__main__":
